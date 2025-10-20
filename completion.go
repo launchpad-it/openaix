@@ -3,9 +3,12 @@ package openaix
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -69,7 +72,7 @@ func Completion[T any](ai *openai.Client, key string, vars ...any) (T, error) {
 	return Chat[T](ai, key).Completion(vars...)
 }
 
-// Chat wraps CreateChatCompletion for a more convenient interface.
+// Chat wraps chat completion API for a more convenient interface.
 // If the type T is a string, the completion requests will return the string content as it is.
 // Otherwise, it expects the content to be a valid JSON and unmarshals it into T.
 // Preserves the chat history.
@@ -80,16 +83,22 @@ func Chat[T any](ai *openai.Client, key string) *ChatContext[T] {
 	return &ChatContext[T]{ai: ai, key: key}
 }
 
+// Completion sends a chat completion request and returns the response.
 func (cc *ChatContext[T]) Completion(vars ...any) (T, error) {
+	return cc.CompletionWithImage(nil, vars...)
+}
+
+// CompletionWithImage allows sending a chat completion request with image.
+func (cc *ChatContext[T]) CompletionWithImage(img io.Reader, vars ...any) (T, error) {
 	historyBefore := slices.Clone(cc.History)
-	v, err := cc.completion(vars...)
+	v, err := cc.completion(img, vars...)
 	if err != nil {
 		cc.History = historyBefore
 	}
 	return v, err
 }
 
-func (cc *ChatContext[T]) completion(vars ...any) (v T, _ error) {
+func (cc *ChatContext[T]) completion(img io.Reader, vars ...any) (v T, _ error) {
 	r, err := configUnmarshalKey[CompletionRequest](cc.key)
 	if err != nil {
 		return v, err
@@ -137,11 +146,31 @@ func (cc *ChatContext[T]) completion(vars ...any) (v T, _ error) {
 	}
 
 	message := openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleUser,
-		Content: r.Prompts.User,
+		Role: openai.ChatMessageRoleUser,
+		MultiContent: []openai.ChatMessagePart{{
+			Type: openai.ChatMessagePartTypeText,
+			Text: r.Prompts.User,
+		}},
 	}
 
-	// Add user message to the history.
+	if img != nil {
+		data, err := io.ReadAll(img)
+		if err != nil {
+			return v, err
+		}
+
+		base, err := encodeImage(data)
+		if err != nil {
+			return v, err
+		}
+
+		message.MultiContent = append(message.MultiContent, openai.ChatMessagePart{
+			Type:     openai.ChatMessagePartTypeImageURL,
+			ImageURL: &openai.ChatMessageImageURL{URL: base},
+		})
+	}
+
+	// Add a user message to the history.
 	cc.History = append(cc.History, message)
 	req.Messages = append(req.Messages, message)
 
@@ -188,4 +217,15 @@ func (cc *ChatContext[T]) completion(vars ...any) (v T, _ error) {
 	}
 
 	return v, nil
+}
+
+func encodeImage(data []byte) (string, error) {
+	switch http.DetectContentType(data) {
+	case "image/jpeg":
+		return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(data), nil
+	case "image/png":
+		return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data), nil
+	default:
+		return "", errors.New("openaix: unsupported image format")
+	}
 }
